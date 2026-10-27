@@ -1,0 +1,493 @@
+"use client";
+export const dynamic = "force-dynamic";
+import React, { useState, useEffect, Suspense, useCallback, useRef } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { ArrowLeft, Loader2 } from "lucide-react";
+import toast from "react-hot-toast";
+import { NODE_API_ENDPOINT } from "@/utils/utils";
+import { DotLottieReact } from "@lottiefiles/dotlottie-react";
+import { NativeAd } from "@/components/ads/NativeAd";
+import { useAppSelector } from "@/app/redux/hooks";
+import { RootState } from "@/app/redux/store";
+import { useTheme } from "next-themes";
+
+interface CaseResult {
+  case_number: string;
+  court_name: string;
+  state: string;
+  hierarchy: string;
+  order_date: string;
+  order_type: string;
+  case_year: string;
+  party_name: string;
+  document_chunks: string[];
+  temp_url?: string;
+  bucket_link?: string;
+  searchCourtSelection?: string;
+  filename?: string;
+  file_link?: string;
+  title?: string; 
+  document_id?: string | number;
+}
+
+interface SearchResponse {
+  data: {
+    results?: CaseResult[];
+  } | CaseResult[];
+}
+
+const SearchResultsLoading = () => (
+  <div className="p-6 flex justify-center items-center">
+    <div className="text-center">
+      <DotLottieReact src="/animations/loading.lottie" loop autoplay />
+      <p className="text-app-secondary mt-4">Loading search results...</p>
+    </div>
+  </div>
+);
+
+const CaseSearchResultsContent: React.FC = () => {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const [searchResults, setSearchResults] = useState<CaseResult[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+  const [endpoint, setEndpoint] = useState("");
+
+  const observerTarget = useRef<HTMLDivElement>(null);
+  const authToken = useAppSelector((state: RootState) => state.auth.token);
+  const processedClawIds = useRef(new Set<string>()); // Ref to track processed IDs
+
+  const searchQuery = searchParams.get("q") || "";
+  const selectedCourt = searchParams.get("court") || "";
+  const startDate = searchParams.get("startDate") || "";
+  const endDate = searchParams.get("endDate") || "";
+  const searchType = searchParams.get("type");
+  const searchByPartyName = searchParams.get("searchByPartyName") === "true";
+
+  const { resolvedTheme } = useTheme();
+  const isDark = resolvedTheme === 'dark';
+
+  const getCourtNameForPayload = (courtName: string): string => {
+    if (courtName === "High court Of Gujarat") {
+      return "High court Of Gujrat";
+    }
+    return courtName;
+  };
+
+  const normalizeCaseResult = (result: any, court: string): CaseResult => {
+    if (court === 'Bare Acts') {
+      return {
+        case_number: String(result.document_id),
+        court_name: 'Bare Acts',
+        filename: result.filename,
+        temp_url: result.temp_url,
+        document_chunks: [`A Bare Act document titled "${result.filename}".`],
+        state: '',
+        hierarchy: 'Statute',
+        order_date: '',
+        order_type: '',
+        case_year: '',
+        party_name: result.filename,
+        document_id: result.document_id,
+      };
+    }
+    return {
+      ...result,
+      party_name: result.party_name || "",
+      document_chunks: Array.isArray(result.document_chunks)
+        ? result.document_chunks
+        : [result.document_chunks || ""],
+    };
+  };
+
+  const storeCaseSearchData = async () => {
+    if (!authToken || !searchQuery) return;
+
+    try {
+      const payload: { prompt: string; startDate?: string; endDate?: string; courtName?: string } = {
+        prompt: searchQuery,
+      };
+      if (startDate) payload.startDate = startDate;
+      if (endDate) payload.endDate = endDate;
+      if (selectedCourt) payload.courtName = selectedCourt;
+
+      fetch(${NODE_API_ENDPOINT}/case/addCaseSearchData, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': Bearer ${authToken},
+        },
+        body: JSON.stringify(payload),
+      });
+    } catch (error) {
+      console.error("Failed to store case search data:", error);
+    }
+  };
+
+  const buildEndpointAndPayload = useCallback((skip: number = 0) => {
+    const baseEndpoint = ${NODE_API_ENDPOINT}/case;
+    const isBareActs = selectedCourt === "Bare Acts";
+    const isKeywordSearch = searchType === "keyword";
+
+    if (isBareActs) {
+      let endpoint = "";
+      const payload = { searchQuery: searchQuery, skip };
+
+      if (isKeywordSearch) {
+        endpoint = ${baseEndpoint}/legalgpt_keyword_search;
+      } else {
+        endpoint = ${baseEndpoint}/legalgpt_hybrid_search;
+      }
+      return { endpoint, payload };
+    }
+
+    const isSupremeCourt = selectedCourt === "Supreme Court of India";
+    const hasCourt = !!selectedCourt;
+    let endpoint = "";
+    let payload: any;
+
+    if (isSupremeCourt) {
+      if (isKeywordSearch) {
+        endpoint = ${baseEndpoint}/caseSearch/supreme_court_keyword_search;
+        payload = { query: searchQuery, skip };
+        if (searchByPartyName) {
+            payload.search_by_party_name = true;
+        }
+      } else {
+        endpoint = ${baseEndpoint}/caseSearch/supreme_court_hybrid_search;
+        payload = { query: searchQuery, skip };
+      }
+    } else {
+      payload = {
+        query: searchQuery,
+        court_name: getCourtNameForPayload(selectedCourt),
+        skip,
+        ...(startDate && { start_date: startDate }),
+        ...(endDate && { end_date: endDate }),
+      };
+      if (isKeywordSearch && hasCourt) {
+        endpoint = ${baseEndpoint}/caseSearch/keyword_by_court;
+        if (searchByPartyName) {
+            payload.search_by_party_name = true;
+        }
+      } else if (isKeywordSearch && !hasCourt) {
+        endpoint = ${baseEndpoint}/caseSearch/keyword_all;
+      } else if (!isKeywordSearch && !hasCourt) {
+        endpoint = ${baseEndpoint}/caseSearch/hybrid_all;
+      } else {
+        endpoint = ${baseEndpoint}/caseSearch;
+      }
+    }
+
+    return { endpoint, payload };
+  }, [searchQuery, selectedCourt, startDate, endDate, searchType, searchByPartyName]);
+
+  const performSearch = useCallback(async () => {
+    setLoading(true);
+
+    const { endpoint: searchEndpoint, payload } = buildEndpointAndPayload(0);
+
+    if (!searchEndpoint || !searchQuery.trim()) {
+      if (!searchQuery.trim()) toast.error("Please enter a search query.");
+      setSearchResults([]);
+      setLoading(false);
+      return;
+    }
+
+    setEndpoint(searchEndpoint);
+    storeCaseSearchData();
+
+    try {
+      const response = await fetch(searchEndpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const results = selectedCourt === 'Bare Acts' ? data.data : data.data.results;
+        const normalizedResults = (results || []).map((item: any) =>
+          normalizeCaseResult(item, selectedCourt)
+        );
+        setSearchResults(normalizedResults);
+
+        if (normalizedResults.length === 0 || normalizedResults.length < 10) {
+          setHasMore(false);
+        }
+      } else {
+        toast.error("Search failed. Please try again.");
+        setSearchResults([]);
+        setHasMore(false);
+      }
+    } catch (error) {
+      console.error("Search error:", error);
+      toast.error("An error occurred during search.");
+      setSearchResults([]);
+      setHasMore(false);
+    } finally {
+      setLoading(false);
+    }
+  }, [searchQuery, buildEndpointAndPayload, selectedCourt]);
+
+  const loadMoreCases = useCallback(async () => {
+    if (isLoadingMore || !hasMore || !endpoint) return;
+
+    setIsLoadingMore(true);
+    const { payload: nextPayload } = buildEndpointAndPayload(searchResults.length);
+
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(nextPayload),
+      });
+
+      if (!response.ok) throw new Error(Server responded with status: ${response.status});
+
+      const resJson = await response.json();
+      const newResults = selectedCourt === 'Bare Acts' ? resJson.data : resJson.data?.results;
+
+      if (Array.isArray(newResults) && newResults.length > 0) {
+        const formattedNewResults = newResults.map((item: any) =>
+          normalizeCaseResult(item, selectedCourt)
+        );
+
+        setSearchResults(prevResults => [...prevResults, ...formattedNewResults]);
+
+        if (formattedNewResults.length < 10) {
+          setHasMore(false);
+        }
+      } else {
+        setHasMore(false);
+      }
+    } catch (error) {
+      console.error('Failed to load more cases:', error);
+      toast.error('Could not load more results.');
+      setHasMore(false);
+    } finally {
+      setIsLoadingMore(false);
+    }
+  }, [isLoadingMore, hasMore, endpoint, searchResults.length, buildEndpointAndPayload, selectedCourt]);
+
+  // Effect to handle party names like "claw-..."
+  useEffect(() => {
+    if (!searchResults.length || !authToken) return;
+
+    const addTitleIds = async (ids: string[]) => {
+      try {
+        await fetch(${NODE_API_ENDPOINT}/case/add-titalIds, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': Bearer ${authToken},
+          },
+          body: JSON.stringify({ ids }),
+        });
+        console.log("Successfully requested titles for IDs:", ids);
+      } catch (error) {
+        console.error("Failed to request titles for claw IDs:", error);
+      }
+    };
+
+    const casesToProcess = searchResults.filter(result =>
+      result.party_name?.startsWith("claw-") &&
+      !processedClawIds.current.has(result.party_name)
+    );
+
+    if (casesToProcess.length > 0) {
+      const idsToSend = casesToProcess.map(c => c.party_name);
+      idsToSend.forEach(id => processedClawIds.current.add(id));
+      addTitleIds(idsToSend);
+    }
+  }, [searchResults, authToken]);
+
+
+  // Intersection Observer for infinite scroll
+  useEffect(() => {
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && hasMore && !isLoadingMore && !loading) {
+          loadMoreCases();
+        }
+      },
+      { threshold: 0.1 }
+    );
+
+    const currentTarget = observerTarget.current;
+    if (currentTarget) {
+      observer.observe(currentTarget);
+    }
+
+    return () => {
+      if (currentTarget) {
+        observer.unobserve(currentTarget);
+      }
+    };
+  }, [hasMore, isLoadingMore, loading, loadMoreCases]);
+
+  useEffect(() => {
+    if (searchQuery) {
+      performSearch();
+    } else {
+      setLoading(false);
+    }
+  }, [performSearch, searchQuery]);
+
+  const handleViewDocument = (caseData: CaseResult) => {
+    // case_number holds the document_id for Bare Acts
+    const caseId = caseData.case_number.trim().replace(/[\s/\\.]+/g, "-");
+
+    const dataToStore = {
+      ...caseData,
+      searchCourtSelection: selectedCourt
+    };
+
+    sessionStorage.setItem(case-${caseId}, JSON.stringify(dataToStore));
+    router.push(/legalDashboard/caseSearch/document/${caseId});
+  };
+
+  const handleBackToSearch = () => {
+    router.push("/legalDashboard/caseSearch");
+  };
+
+  if (loading) {
+    return (
+      <div className="p-6 flex justify-center items-center min-h-[70vh]">
+        <div className="text-center">
+          <DotLottieReact
+            src={isDark ? "/animations/loading-dark.lottie" : "/animations/loading-light.lottie"}
+            loop
+            autoplay
+          />
+          <p className="text-app-secondary mt-4">Searching for documents...</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6">
+      <div className="space-y-6">
+        <div className="flex items-center gap-4">
+          <button
+            onClick={handleBackToSearch}
+            className="flex items-center text-app-primary hover:text-[var(--accent-end)] transition-colors">
+            <ArrowLeft className="w-6 h-6" />
+          </button>
+          <div className="text-center flex-1">
+            <h2 className="text-lg font-semibold text-[var(--accent-end)] mb-2">
+              Search Results
+            </h2>
+            <p className="text-sm text-app-secondary">
+              Found {searchResults.length}+ documents for "{searchQuery}"
+              {selectedCourt && ` in ${selectedCourt}`}
+            </p>
+          </div>
+        </div>
+
+        <div className="space-y-4 overflow-auto max-h-[70vh] mx-auto rounded-lg custom-scrollbar">
+          {searchResults.length === 0 ? (
+            <div className="text-center py-12">
+              <p className="text-app-secondary text-lg">No documents found</p>
+              <p className="text-app-tertiary text-sm mt-2">
+                Try adjusting your search criteria
+              </p>
+            </div>
+          ) : (
+            <>
+              {searchResults.map((result, index) => (
+                <React.Fragment key={${result.case_number}-${index}}>
+                  <div className="card-app border rounded-lg p-4 flex justify-between items-start hover:border-[var(--accent-end)] transition-colors card-app-hover">
+                    <div className="flex-1 min-w-0">
+                      {selectedCourt === 'Bare Acts' ? (
+                        <h3 className="text-app-primary font-medium mb-2 truncate" title={result.filename}>
+                          {result.filename}
+                        </h3>
+                      ) : selectedCourt === 'Supreme Court of India' && result.title ? (
+                        <>
+                          <h3 className="text-app-primary font-medium mb-2 truncate" title={result.title}>
+                            {result.title}
+                          </h3>
+                          <p className="text-app-primary font-semibold text-sm mb-2 truncate" title={${result.case_number} - ${result.court_name}}>
+                            {${result.case_number} - ${result.court_name}}
+                          </p>
+                        </>
+                      ) : result.party_name && !result.party_name.startsWith("claw-") ? (
+                        <>
+                          <h3 className="text-app-primary font-medium mb-2 truncate" title={result.party_name}>
+                            {result.party_name}
+                          </h3>
+                          <p className="text-app-primary font-semibold text-sm mb-2 truncate" title={${result.case_number} - ${result.court_name}}>
+                            {${result.case_number} - ${result.court_name}}
+                          </p>
+                        </>
+                      ) : (
+                        <h3 className="text-app-primary font-medium mb-2 truncate" title={result.case_number}>
+                          {${result.case_number} - ${result.court_name}}
+                        </h3>
+                      )}
+
+                      {selectedCourt !== 'Bare Acts' && (
+                        <p className="text-app-secondary text-sm mb-2">
+                          Order Date: {result.order_date} {result.state ? "| State: " + result.state : ""}
+                        </p>
+                      )}
+                      <p className="text-app-tertiary text-sm break-words">
+                        {result.document_chunks[0].substring(0, 200)}...
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => handleViewDocument(result)}
+                      className="btn-primary px-4 py-2 rounded text-sm ml-4 transition-colors cursor-pointer whitespace-nowrap">
+                      View Document
+                    </button>
+                  </div>
+                  {(index + 1) % 2 === 0 && (
+                    <NativeAd
+                      position={case-results-${index}}
+                      zoneId="171837"
+                      className="my-4"
+                    />
+                  )}
+                </React.Fragment>
+              ))}
+
+              <div ref={observerTarget} className="h-4" />
+
+              {isLoadingMore && (
+                <div className="flex justify-center items-center py-8">
+                  <div className="flex items-center gap-3">
+                    <Loader2 className="w-6 h-6 animate-spin text-[var(--accent-end)]" />
+                    <p className="text-app-secondary">Loading more documents...</p>
+                  </div>
+                </div>
+              )}
+
+              {!hasMore && searchResults.length > 0 && (
+                <div className="text-center py-8">
+                  <p className="text-app-tertiary">No more documents to load</p>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const CaseSearchResultsPage: React.FC = () => {
+  return (
+    <Suspense fallback={<SearchResultsLoading />}>
+      <CaseSearchResultsContent />
+    </Suspense>
+  );
+};
+
+export default CaseSearchResultsPage;
